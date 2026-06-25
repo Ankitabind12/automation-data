@@ -66,7 +66,7 @@ export default function EmailPage({
     setConsoleLogs(p => [...p, { id: Date.now(), text: `[${new Date().toLocaleTimeString()}] Triggering compliance campaign for ${vendors.length} vendors...`, type: 'info' }]);
 
     try {
-      const response = await fetch('https://vendorapi-production-e486.up.railway.app/send-emails', {
+      const response = await fetch('http://localhost:4000/send-emails', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -106,7 +106,7 @@ export default function EmailPage({
           };
           
           // Persist to database so it doesn't vanish on refresh
-          fetch('https://vendorapi-production-e486.up.railway.app/vendors', {
+          fetch('http://localhost:4000/vendors', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(updatedVendor)

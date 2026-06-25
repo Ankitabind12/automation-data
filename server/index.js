@@ -1,15 +1,29 @@
 require('dotenv').config();
-const express    = require('express');
-const cors       = require('cors');
-const nodemailer = require('nodemailer');
-const { spawn }  = require('child_process');
-const fs         = require('fs');
-const path       = require('path');
-const db         = require('./db');
+const express      = require('express');
+const cors         = require('cors');
+const compression  = require('compression');
+const nodemailer   = require('nodemailer');
+const { spawn }    = require('child_process');
+const fs           = require('fs');
+const path         = require('path');
+const db           = require('./db');
 
 const app = express();
+app.use(compression()); // gzip all responses
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '2mb' }));
+
+// ── Simple in-memory cache ──────────────────────────────────────
+const CACHE_TTL_MS = 30_000; // 30 seconds
+const cache = new Map();
+const getCache = (key) => {
+  const entry = cache.get(key);
+  if (!entry) return null;
+  if (Date.now() - entry.ts > CACHE_TTL_MS) { cache.delete(key); return null; }
+  return entry.data;
+};
+const setCache = (key, data) => cache.set(key, { data, ts: Date.now() });
+const clearCache = (...keys) => keys.forEach(k => cache.delete(k));
 
 // ── Nodemailer transporter ───────────────────────────────────────
 const transporter = nodemailer.createTransport({
@@ -40,13 +54,16 @@ async function cleanDummyData() {
   }
 }
 
-// ── Health check ─────────────────────────────────────────────────
+// ── Health check ───────────────────────────────────────────────
 app.get('/ping', (req, res) => res.json({ status: 'ok', service: 'Dow Chemical SDS Compliance API' }));
 
-// ── GET /vendors ──────────────────────────────────────────────────
+// ── GET /vendors (cached) ───────────────────────────────────────
 app.get('/vendors', async (req, res) => {
   try {
+    const cached = getCache('vendors');
+    if (cached) return res.json(cached);
     const list = await db.getVendors();
+    setCache('vendors', list);
     res.json(list);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -57,21 +74,21 @@ app.get('/vendors', async (req, res) => {
 app.post('/vendors', async (req, res) => {
   try {
     const vendor = req.body;
-    if (!vendor.id) {
-      vendor.id = 'v-' + Date.now();
-    }
+    if (!vendor.id) vendor.id = 'v-' + Date.now();
     const saved = await db.saveVendor(vendor);
+    clearCache('vendors'); // invalidate cache on write
     res.json(saved);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// ── DELETE /vendors/:id ───────────────────────────────────────────
+// ── DELETE /vendors/:id ───────────────────────────────────────────────
 app.delete('/vendors/:id', async (req, res) => {
   try {
     const { id } = req.params;
     await db.deleteVendor(id);
+    clearCache('vendors'); // invalidate cache on delete
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -99,32 +116,30 @@ app.post('/send-emails', async (req, res) => {
     return res.status(400).json({ error: 'No vendors provided' });
   }
 
-  const results = [];
+  const results = await Promise.allSettled(
+    vendors.map(async (vendor) => {
+      const htmlBody = buildHtmlEmail(vendor, body);
+      const mailOptions = {
+        from:    `"Dow Chemical Compliance" <${process.env.EMAIL}>`,
+        to:      vendor.email,
+        subject: subject || 'Action Required: Submit Updated SDS/MSDS Documentation – Dow Chemical',
+        html:    htmlBody,
+        text: body
+          .replace('{vendor_name}', vendor.name)
+          .replace('{contact_person}', vendor.contact || vendor.name)
+      };
+      try {
+        await transporter.sendMail(mailOptions);
+        console.log(`✅ Sent to ${vendor.email}`);
+        return { vendor: vendor.email, name: vendor.name, status: 'sent' };
+      } catch (err) {
+        console.error(`❌ Failed to send to ${vendor.email}:`, err.message);
+        return { vendor: vendor.email, name: vendor.name, status: 'failed', error: err.message };
+      }
+    })
+  );
 
-  for (const vendor of vendors) {
-    const htmlBody = buildHtmlEmail(vendor, body);
-
-    const mailOptions = {
-      from:    `"Dow Chemical Compliance" <${process.env.EMAIL}>`,
-      to:      vendor.email,
-      subject: subject || 'Action Required: Submit Updated SDS/MSDS Documentation – Dow Chemical',
-      html:    htmlBody,
-      text: body
-        .replace('{vendor_name}', vendor.name)
-        .replace('{contact_person}', vendor.contact || vendor.name)
-    };
-
-    try {
-      await transporter.sendMail(mailOptions);
-      results.push({ vendor: vendor.email, name: vendor.name, status: 'sent' });
-      console.log(`✅ Sent to ${vendor.email}`);
-    } catch (err) {
-      console.error(`❌ Failed to send to ${vendor.email}:`, err.message);
-      results.push({ vendor: vendor.email, name: vendor.name, status: 'failed', error: err.message });
-    }
-  }
-
-  res.json({ results });
+  res.json({ results: results.map(r => r.value || r.reason) });
 });
 
 // ── POST /run-imap-scan ──────────────────────────────────────────
@@ -185,12 +200,12 @@ app.post('/run-imap-scan', (req, res) => {
 
     const allRecords = records.length > 0 ? records : fileRecords;
 
-    // Automatically sync scanned records & update vendor statuses in database
-    for (const rec of allRecords) {
+    // Parallel SDS saves + vendor updates — much faster than sequential awaits
+    const vendorsList = await db.getVendors();
+    await Promise.allSettled(allRecords.map(async (rec) => {
       const isCompliant = rec.productName && rec.revisionDate && rec.emergencyContact;
       const compStatus = isCompliant ? 'Compliant' : 'Under Review';
-      
-      // Save SDS document
+
       await db.saveSdsDocument({
         id: rec.id || 'sds-' + Math.random(),
         vendorName: rec.vendorName || rec.sender || 'Unknown Vendor',
@@ -204,10 +219,8 @@ app.post('/run-imap-scan', (req, res) => {
         failureReason: isCompliant ? '' : 'Missing critical section parameters'
       });
 
-      // Update matching vendor
-      const vendorsList = await db.getVendors();
-      const match = vendorsList.find(v => 
-        v.name.toLowerCase() === (rec.vendorName || '').toLowerCase() || 
+      const match = vendorsList.find(v =>
+        v.name.toLowerCase() === (rec.vendorName || '').toLowerCase() ||
         v.email.toLowerCase() === (rec.sender || '').toLowerCase()
       );
       if (match) {
@@ -218,7 +231,8 @@ app.post('/run-imap-scan', (req, res) => {
           complianceStatus: compStatus
         });
       }
-    }
+    }));
+    clearCache('vendors', 'sds-data');
 
     res.json({
       status:  'complete',
@@ -236,12 +250,15 @@ app.post('/run-imap-scan', (req, res) => {
   });
 });
 
-// ── GET /sds-data ────────────────────────────────────────────────
-// Returns previously extracted SDS data from database
+// ── GET /sds-data (cached) ────────────────────────────────────────────
 app.get('/sds-data', async (req, res) => {
   try {
+    const cached = getCache('sds-data');
+    if (cached) return res.json(cached);
     const list = await db.getSdsDocuments();
-    res.json({ records: list, count: list.length });
+    const payload = { records: list, count: list.length };
+    setCache('sds-data', payload);
+    res.json(payload);
   } catch (err) {
     res.status(500).json({ error: 'Failed to read SDS data.' });
   }

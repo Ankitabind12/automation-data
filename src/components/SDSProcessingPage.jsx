@@ -37,7 +37,7 @@ export default function SDSProcessingPage({
     setScanLogs([{ time: new Date().toLocaleTimeString(), text: 'Connecting to IMAP mailbox (heypk4@gmail.com)...', type: 'info' }]);
 
     try {
-      const response = await fetch('https://vendorapi-production-e486.up.railway.app/run-imap-scan', {
+      const response = await fetch('http://localhost:4000/run-imap-scan', {
         method: 'POST'
       });
       const data = await response.json();
