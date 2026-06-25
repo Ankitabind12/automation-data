@@ -29,19 +29,30 @@ export default function App() {
   const [authLoading, setAuthLoading] = useState(true);
 
   useEffect(() => {
-    // Check initial session (handles OAuth redirect + existing sessions)
     supabase.auth.getSession().then(({ data: { session } }) => {
       if (session?.user) {
         const u = session.user;
-        setCurrentUser({
+        const userData = {
           name: u.user_metadata?.full_name || u.email?.split('@')[0] || u.phone || 'User',
           email: u.email || u.phone || '',
           avatar: (u.user_metadata?.full_name || u.email || u.phone || 'U').slice(0, 2).toUpperCase(),
           role: u.user_metadata?.role || 'Compliance Analyst',
           provider: u.app_metadata?.provider || 'email',
-        });
+        };
+        setCurrentUser(userData);
         setIsAuthenticated(true);
         setActivePage('dashboard');
+        
+        // Sync user to public database table
+        if (userData.email) {
+          supabase.from('users').upsert({
+            email: userData.email,
+            name: userData.name,
+            avatar: userData.avatar,
+            role: userData.role,
+            provider: userData.provider
+          }).catch(console.error);
+        }
       }
       setAuthLoading(false);
     });
@@ -50,15 +61,27 @@ export default function App() {
     const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
       if (session?.user) {
         const u = session.user;
-        setCurrentUser({
+        const userData = {
           name: u.user_metadata?.full_name || u.email?.split('@')[0] || u.phone || 'User',
           email: u.email || u.phone || '',
           avatar: (u.user_metadata?.full_name || u.email || u.phone || 'U').slice(0, 2).toUpperCase(),
           role: u.user_metadata?.role || 'Compliance Analyst',
           provider: u.app_metadata?.provider || 'email',
-        });
+        };
+        setCurrentUser(userData);
         setIsAuthenticated(true);
         setActivePage('dashboard');
+        
+        // Sync user to public database table
+        if (userData.email) {
+          supabase.from('users').upsert({
+            email: userData.email,
+            name: userData.name,
+            avatar: userData.avatar,
+            role: userData.role,
+            provider: userData.provider
+          }).catch(console.error);
+        }
       } else {
         setCurrentUser(null);
         setIsAuthenticated(false);
